@@ -10,10 +10,11 @@
 //#include <boost/thread/recursive_mutex.hpp>
 #include <sstream>
 //#include <mutex>
-#include <glog/logging.h>
+//#include <glog/logging.h>
 #include "ConcurrentHashMap.h" 
 #include <tbb/concurrent_queue.h>
 #include <atomic>
+#include <future>
 //namespace lrucache{
 using std::chrono::system_clock;
 using std::chrono::milliseconds;
@@ -28,34 +29,37 @@ public:
 
         std::shared_ptr<Node> pre = nullptr;
         std::shared_ptr<Node> next = nullptr;
-        Node (const k& key_, const v& data_):key(key_),data(data_),pre(nullptr),next(nullptr),emptyCount(-1){
+        Node (const k& key_, const v& data_):key(key_),data(data_),pre(nullptr),next(nullptr){
         }
-        Node ():pre(nullptr),next(nullptr),emptyCount(-1){}
+        Node ():pre(nullptr),next(nullptr){}
         ~Node(){
             pre = nullptr;next = nullptr;
+            std::cout << "~Node delete node:" << key << std::endl;
         }
         bool evicted = false;
     }Node;
 private:
     int capacity;
-    int size = 0;
-    int64_t duration;
-    boost::recursive_mutex mutex;
+    std::shared_ptr<Node> head;
+    std::shared_ptr<Node> tail;
     ConcurrentHashMap<k, std::shared_ptr<Node>> map;
     ConcurrentHashMap<k, int64_t>  logMap[2];
     short index = 0;
 
-    tbb::concurrent_queue<std::shared_ptr<Node>> evictQueue;
+    tbb::concurrent_bounded_queue<std::shared_ptr<Node>> evictQueue;
     std::atomic_flag lockLog = ATOMIC_FLAG_INIT;
+    std::thread thread_;
+    bool shutdown = false;
 public:
     void swap(){
-        index != index;
+        index = 1 - index;
     }
+    /*
     int64_t currentTimeMill(){
         auto start = system_clock::now();
         int64_t time = (std::chrono::duration_cast<milliseconds>(start.time_since_epoch())).count();
         return time;
-    }
+    }*/
     void insertHead(std::shared_ptr<Node> newNode) {
 //        while(!headGuard.test_and_set());
         auto temp = head->next;
@@ -75,34 +79,26 @@ public:
     }
     
     bool del(std::shared_ptr<Node> node, const std::string& sour = "not redolog") {
-/*
-        if(nullptr == node){
-            LOG(INFO) << "delete node is nullptr";
-            return false;
-        }
-        if (node->pre ==nullptr || node->next == nullptr) {
-            LOG(INFO) << "cant not delete tail or head node! or the node is not in cache, source:" << sour << std::endl;
-            return false;
-        }
-*/
-//        extract(node);
         node->evicted = true;
         evictQueue.push(node);
         map.erase(node->key);
-        LOG(INFO) << "del:" << node->key << std::endl;
+        //LOG(INFO) << "del:" << node->key << std::endl;
+        std::cout << "del:" << node->key << std::endl;
         return true;
     }
 
     // async run in single thread
     int clearEvictQueue() {
+        std::cout << "bg thread" << std::endl;
         int cnt = 0;
-        while(true) {
-            std::share_ptr<Node> t = nullptr;
+        while(!shutdown) {
+            std::shared_ptr<Node> t = nullptr;
             evictQueue.pop(t);
+            std::cout << "notify" << std::endl;
             if(t != nullptr){
                 cnt++;
                 extract(t);
-                std::cout << "delete:" << t->key;
+                std::cout << "delete:" << t->key << std::endl;
             }
         }
     }
@@ -113,19 +109,25 @@ public:
     void deleteLast() {
         auto key = tail->pre->key;
         if(del(tail->pre)){
-            size--;
             map.erase(key);
         }
     }
     
     void updateNode(const k& key){
         std::shared_ptr<Node> valNode = map.get(key);
-        valNode->evict = true; //mark as deleted
+        updateNode(valNode);
+    }
+
+    void updateNode(std::shared_ptr<Node> valNode){
+        valNode->evicted = true; //mark as deleted
+
         //valNode->accessTime = ct;
         //extract(valNode);
-        std::share_ptr<Node> newNode = std::make_shared<Node>(valNode->key,valNode->val);
+        std::shared_ptr<Node> newNode = std::make_shared<Node>(valNode->key,valNode->data);
         insertHead(newNode);
-        map.put(key,newNode);//delete in map
+        map.put(valNode->key,newNode);//delete in map
+        std::cout << "push:" << valNode->key << std::endl;
+        evictQueue.push(valNode);
     }
     
     void reDoLog(){
@@ -133,74 +135,95 @@ public:
         auto bak = 1 - index;
         auto itr = logMap[bak].begin();
         auto end = logMap[bak].end();
-        auto ct = currentTimeMill();
         for(; itr != end; itr++) {
             auto innerKey = itr->first;
+            std::cout << "redo" << bak << ":" << innerKey << std::endl;
             std::shared_ptr<Node> valNode = map.get(innerKey);
             if(valNode != nullptr) {
-                if((itr->second == -1)&& del(valNode, "redolog")){
-                    // expired
-                    size--;
-                    map.erase(innerKey);
-                } else {
-                    updateNode(innerKey, ct);
-                }
+                updateNode(valNode);
             }
 //            logMap[bak].erase(itr->first);
         }
         logMap[bak].clear();
     }
 public:
-    explicit LruCache(int cap = 10,int64_t duration = 1000 * 10):capacity(cap){
-        this->duration = duration;
+    int volume(){
+        return this->map.size();
+    }
+
+    int evictQueueSize(){
+        return this->evictQueue.size();
+    }
+
+
+
+
+    explicit LruCache(int cap = 10):capacity(cap){
         head = std::make_shared<Node>();
         tail = std::make_shared<Node>();
         head->next = tail;
         tail->pre = head;
         head->pre = nullptr;
         tail->next = nullptr;
-        this->size = 0;
-        std::async(std::launch::async,clearEvictQueue);
+    }
+    virtual ~LruCache(){
+        tail = head = nullptr;
+        shutdown = true;
+        //if(thread_.joinable()) thread_.join();
+
+    }
+    void init(){
+        std::thread thread(&LruCache::clearEvictQueue,this);
+        std::swap(thread,thread_);
+        thread_.detach();
     }
 
-    int volume(){
-        return this->size;
+    void join(){
+        thread_.join();
     }
 
-    void printAll(){
-        boost::recursive_mutex::scoped_lock lock(mutex);
-        std::stringstream ss;
-        auto it = head->next;
-        while (it != nullptr && it != tail) {
-           ss << it->key << ",";
-           it = it->next;
-        }
-        LOG(ERROR) << ss.str();
-    }
-    T get(const k& key) {
+    bool get(const k& key, v& t) {
             auto valNode = map.get(key);
             if(nullptr != valNode){
-                logMap[index].put(key,currenttime);
-                return valNode->val;
+                std::cout << "put log" << index << ":" << key << std::endl;
+                logMap[index].put(key,1);
+                t = std::move(valNode->data);
+                return true;
             }
-            return NULL;
+            return false;
     }
 
-    int set(const k& key, const T& val) {
-        if(lockLog.test_and_set(std::memory_order_acquire)) {
+    void set(const k& key, const v& val) {
+        if(!lockLog.test_and_set(std::memory_order_acquire)) {
             reDoLog();
-            lockLog(std::memory_order_release);
+            lockLog.clear(std::memory_order_release);
         }
-        LOG(INFO) << "put:" << key << std::endl;
+        //LOG(INFO) << "put:" << key << std::endl;
         if (map.contains(key)) {
             updateNode(key);
         } else {
             auto newNode = std::make_shared<Node>(key, val);
-            newNode->accessTime = curtime;
             insertHead(newNode);
             map.put(key, newNode);
         }
-        return miss;
+    }
+    void erase(const k& key){
+        auto node = map.get(key);
+        if(nullptr != node){
+            evictQueue.push(node);
+            map.erase(key);
+        }
+    }
+    void printAll(){
+        std::stringstream ss;
+        auto it = head->next;
+        while (it != nullptr && it != tail) {
+            if(!it->evicted)
+                ss << it->key << ",";
+            it = it->next;
+        }
+        std::cout << ss.str() << std::endl;
+        //LOG(ERROR) << ss.str();
     }
 };        
 //}//lrucache namespace end
