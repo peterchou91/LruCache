@@ -1,21 +1,24 @@
 #pragma once
 /**
  * author:zhouqing
+ * todo:memory allocator
  */
 #include <iostream>
 #include <vector>
 #include <map>
 #include <memory>
-#include <boost/thread/recursive_mutex.hpp>
+//#include <boost/thread/recursive_mutex.hpp>
 #include <sstream>
-#include <mutex>
+//#include <mutex>
 #include <glog/logging.h>
 #include "ConcurrentHashMap.h" 
+#include <tbb/concurrent_queue.h>
+#include <atomic>
 //namespace lrucache{
 using std::chrono::system_clock;
 using std::chrono::milliseconds;
 
-
+const int TRYCOUNT = 2;
 template<typename k, typename v>
 class LruCache {
 public:
@@ -23,17 +26,15 @@ public:
         k key;
         v data;
 
-        int64_t accessTime;
-        int emptyCount;
-
-        std::shared_ptr<Node> pre;
-        std::shared_ptr<Node> next;
+        std::shared_ptr<Node> pre = nullptr;
+        std::shared_ptr<Node> next = nullptr;
         Node (const k& key_, const v& data_):key(key_),data(data_),pre(nullptr),next(nullptr),emptyCount(-1){
         }
         Node ():pre(nullptr),next(nullptr),emptyCount(-1){}
         ~Node(){
+            pre = nullptr;next = nullptr;
         }
-
+        bool evicted = false;
     }Node;
 private:
     int capacity;
@@ -43,8 +44,9 @@ private:
     ConcurrentHashMap<k, std::shared_ptr<Node>> map;
     ConcurrentHashMap<k, int64_t>  logMap[2];
     short index = 0;
-    std::shared_ptr<Node> head;
-    std::shared_ptr<Node> tail;
+
+    tbb::concurrent_queue<std::shared_ptr<Node>> evictQueue;
+    std::atomic_flag lockLog = ATOMIC_FLAG_INIT;
 public:
     void swap(){
         index != index;
@@ -55,24 +57,16 @@ public:
         return time;
     }
     void insertHead(std::shared_ptr<Node> newNode) {
+//        while(!headGuard.test_and_set());
         auto temp = head->next;
         head->next = newNode;
         newNode->pre = head;
         newNode->next = temp;
         temp->pre = newNode;
+//        headGuard.clear();
     }
     
     void extract(std::shared_ptr<Node> node) {
-        /*
-        if(nullptr == node){
-            LOG(INFO) << "extract node is nullptr";
-            return;
-        }
-        if (node->pre ==nullptr || node->next == nullptr) {
-            LOG(INFO) << "cant not extract tail or head node! or the node is not in cache" << std::endl;
-            return;
-        }
-        */
         auto nextNode = node->next;
         auto preNode = node->pre;
         preNode->next = nextNode;
@@ -81,6 +75,7 @@ public:
     }
     
     bool del(std::shared_ptr<Node> node, const std::string& sour = "not redolog") {
+/*
         if(nullptr == node){
             LOG(INFO) << "delete node is nullptr";
             return false;
@@ -89,9 +84,27 @@ public:
             LOG(INFO) << "cant not delete tail or head node! or the node is not in cache, source:" << sour << std::endl;
             return false;
         }
-        extract(node);
+*/
+//        extract(node);
+        node->evicted = true;
+        evictQueue.push(node);
+        map.erase(node->key);
         LOG(INFO) << "del:" << node->key << std::endl;
         return true;
+    }
+
+    // async run in single thread
+    int clearEvictQueue() {
+        int cnt = 0;
+        while(true) {
+            std::share_ptr<Node> t = nullptr;
+            evictQueue.pop(t);
+            if(t != nullptr){
+                cnt++;
+                extract(t);
+                std::cout << "delete:" << t->key;
+            }
+        }
     }
 
     /**
@@ -105,20 +118,16 @@ public:
         }
     }
     
-
-
-    void updateNode(const k& key, int64_t ct){
+    void updateNode(const k& key){
         std::shared_ptr<Node> valNode = map.get(key);
-        valNode->accessTime = ct;
-        extract(valNode);
-        LOG(INFO) << "extract:" << valNode->key << std::endl;
-        insertHead(valNode);
+        valNode->evict = true; //mark as deleted
+        //valNode->accessTime = ct;
+        //extract(valNode);
+        std::share_ptr<Node> newNode = std::make_shared<Node>(valNode->key,valNode->val);
+        insertHead(newNode);
+        map.put(key,newNode);//delete in map
     }
     
-    void updateNode(const k& key) {
-        updateNode(key,currentTimeMill());
-    }
-
     void reDoLog(){
         swap();
         auto bak = 1 - index;
@@ -151,6 +160,7 @@ public:
         head->pre = nullptr;
         tail->next = nullptr;
         this->size = 0;
+        std::async(std::launch::async,clearEvictQueue);
     }
 
     int volume(){
@@ -167,83 +177,29 @@ public:
         }
         LOG(ERROR) << ss.str();
     }
-    int getAllPresent(const std::vector<k>& keys,
-        std::map<k, v> & values, std::vector<k> & missingKeys) {
-        int hits = 0;
-        auto currenttime = currentTimeMill();
-        for (auto key : keys) {
-            if(!map.contains(key)) {
-                missingKeys.push_back(key);
-                continue;
-            }
+    T get(const k& key) {
             auto valNode = map.get(key);
-            if(nullptr == valNode) {
-                missingKeys.push_back(key);
-                continue;
+            if(nullptr != valNode){
+                logMap[index].put(key,currenttime);
+                return valNode->val;
             }
-            if(valNode->accessTime / 1000 + this->duration < currenttime / 1000) {
-                logMap[index].put(key, -1);
-                missingKeys.push_back(key);
-//                LOG(ERROR) << "expired";
-                continue;
-            }
-            if(valNode->emptyCount >= 0 && valNode->emptyCount < 2) {
-                missingKeys.push_back(key);
-                continue;
-            }
-            hits++;
-            if(valNode->emptyCount == -1) {
-                values.insert(std::pair<k,v>(key, valNode->data));
-            }
-            logMap[index].put(key,currenttime);
-        }
-//        LOG(ERROR) << "keysize:" << keys.size() << " miss keysize:" << miss;
-        return hits;
+            return NULL;
     }
 
-    int insertNewElements(const std::vector<k>& keys, const std::map<k, v> & values) {
-        boost::recursive_mutex::scoped_lock lock(mutex);
-        size_t count = keys.size();
-        int miss = 0;
-        reDoLog();
-        if(count == 0) return 0;
-        auto curtime = currentTimeMill();
-        for(int i = 0; i < count; i++) {
-            const auto& key = keys[i];
-            auto it = values.find(key);
-            if(it == values.end()) {
-                auto valNode = map.get(key);
-                if (nullptr == valNode) {
-                    auto newNode = std::make_shared<Node>();
-                    newNode->accessTime = curtime;
-                    newNode->key = key;
-                    newNode->emptyCount = 0;
-                } else {
-                    if (valNode->emptyCount < 0) continue;
-                    else {
-                        if(valNode->emptyCount < 1)valNode->emptyCount ++;
-                    }
-                }
-                miss++;
-                continue;
-            }
-            const auto& val = it->second;
-            LOG(INFO) << "put:" << key << std::endl;
-            if (map.contains(key)) {
-                updateNode(key);
-            } else {
-                LOG(INFO) << "size:" << size << " " << map.size() << std::endl;
-                if (size >= capacity) {
-                    deleteLast();
-                }
-                auto newNode = std::make_shared<Node>(key, val);
-                newNode->accessTime = curtime;
-                insertHead(newNode);
-                map.put(key, newNode);
-                size++;
-            }
+    int set(const k& key, const T& val) {
+        if(lockLog.test_and_set(std::memory_order_acquire)) {
+            reDoLog();
+            lockLog(std::memory_order_release);
         }
-//        LOG(ERROR) << "insert miss:" << miss;
+        LOG(INFO) << "put:" << key << std::endl;
+        if (map.contains(key)) {
+            updateNode(key);
+        } else {
+            auto newNode = std::make_shared<Node>(key, val);
+            newNode->accessTime = curtime;
+            insertHead(newNode);
+            map.put(key, newNode);
+        }
         return miss;
     }
 };        
